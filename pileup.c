@@ -6,6 +6,7 @@
 #include <ctype.h>
 #include <stdio.h>
 #include <math.h>
+#include <pthread.h>
 #include "htslib/sam.h"
 #include "htslib/faidx.h"
 #include "ksort.h"
@@ -70,7 +71,7 @@ static int read_bam(void *data, bam1_t *b) // read level filters better go here 
 
 typedef struct {
 	uint32_t is_skip:1, is_rev:1, b:4, q:8, is_del:1, k:17; // b=base, q=quality, k=allele id
-	int indel; // <0: deleteion; >0: insertion
+	int indel; // <0: deletion; >0: insertion
 	uint64_t hash;
 	uint64_t pos; // i<<32|j: j-th read of the i-th sample
 } allele_t;
@@ -107,29 +108,29 @@ static inline allele_t pileup2allele(const bam_pileup1_t *p, int min_baseQ, uint
 	return a;
 }
 
-static inline void print_allele(const bam_pileup1_t *p, int l_ref, const char *ref, int pos, int max_del, int is_vcf, int del_as_allele)
+static inline void print_allele(FILE *out, const bam_pileup1_t *p, int l_ref, const char *ref, int pos, int max_del, int is_vcf, int del_as_allele)
 { // print the allele. The format depends on is_vcf.
 	const uint8_t *seq = bam_get_seq(p->b);
 	int i, rest = max_del;
 	if (del_as_allele && p->is_del) {
-		putchar('*');
+		fputc('*', out);
 		return;
 	}
-	putchar(seq_nt16_str[bam_seqi(seq, p->qpos)]);
+	fputc(seq_nt16_str[bam_seqi(seq, p->qpos)], out);
 	if (p->indel > 0) {
-		if (!is_vcf) printf("+%d", p->indel);
+		if (!is_vcf) fprintf(out, "+%d", p->indel);
 		for (i = 1; i <= p->indel; ++i)
-			putchar(seq_nt16_str[bam_seqi(seq, p->qpos + i)]);
+			fputc(seq_nt16_str[bam_seqi(seq, p->qpos + i)], out);
 	} else if (p->indel < 0) {
 		if (!is_vcf) {
-			printf("%d", p->indel);
+			fprintf(out, "%d", p->indel);
 			for (i = 1; i <= -p->indel; ++i)
-				putchar(pos + i < l_ref? toupper(ref[pos+i]) : 'N');
+				fputc(pos + i < l_ref? toupper(ref[pos+i]) : 'N', out);
 		} else rest -= -p->indel, pos += -p->indel;
 	}
 	if (is_vcf)
 		for (i = 1; i <= rest; ++i)
-			putchar(pos + i < l_ref? toupper(ref[pos+i]) : 'N');
+			fputc(pos + i < l_ref? toupper(ref[pos+i]) : 'N', out);
 }
 
 typedef struct {
@@ -175,28 +176,245 @@ static void count_alleles(paux_t *pa, int n)
 	}
 }
 
+// Arguments passed to each worker thread (or used directly for single-threaded run).
+typedef struct {
+	// files
+	int n_files;
+	char **filenames;     // argv + o.ind; read-only
+	const char *fname_ref;
+	// shared read-only state
+	sam_hdr_t *h;
+	void *bed;
+	bed_site_t *sites;
+	int nsites;
+	// site range this thread is responsible for: [si_beg, si_end)
+	int si_beg, si_end;
+	// for the nsites==0 (streaming) path
+	int tid, beg, end;
+	// filter params
+	int baseQ, mapQ, min_len, min_supp_len, proper_only;
+	int is_vcf, var_only, show_2strand, trim_len, del_as_allele;
+	int min_support, min_support_strand;
+	double min_af;
+	// output: written here by the thread; main flushes to stdout in order
+	FILE *out;
+	char *out_buf;
+	size_t out_len;
+} thread_arg_t;
+
+static void process_sites(thread_arg_t *a)
+{
+	int i, j, n = a->n_files;
+	int tid = -1, pos;
+	int last_tid = -1;
+	int l_ref = 0;
+	char *ref = NULL;
+	bam_mplp_t mplp;
+	FILE *out = a->out;
+
+	int *n_plp = (int*)calloc(n, sizeof(int));
+	const bam_pileup1_t **plp = (const bam_pileup1_t**)calloc(n, sizeof(const bam_pileup1_t*));
+	paux_t pa;
+	memset(&pa, 0, sizeof(paux_t));
+
+	// each thread opens its own fai to avoid sharing a seekable file handle
+	faidx_t *fai = a->fname_ref? fai_load(a->fname_ref) : NULL;
+
+	// open per-thread file handles; use shared indices if pre-loaded
+	aux_t **data = (aux_t**)calloc(n, sizeof(aux_t*));
+	hts_idx_t **idx = (hts_idx_t**)calloc(n, sizeof(hts_idx_t*));
+	for (i = 0; i < n; ++i) {
+		data[i] = (aux_t*)calloc(1, sizeof(aux_t));
+		data[i]->fp = hts_open(a->filenames[i], "r");
+		if (a->fname_ref) hts_set_fai_filename(data[i]->fp, a->fname_ref);
+		data[i]->min_mapQ = a->mapQ;
+		data[i]->min_len  = a->min_len;
+		data[i]->min_supp_len = a->min_supp_len;
+		data[i]->proper_only = a->proper_only;
+		data[i]->bed = a->bed;
+		sam_hdr_t *htmp = sam_hdr_read(data[i]->fp); // must read to advance past header
+		sam_hdr_destroy(htmp);
+		data[i]->h = a->h; // use shared header (read-only)
+		if (a->nsites > 0) {
+			idx[i] = sam_index_load(data[i]->fp, a->filenames[i]);
+		} else if (a->tid >= 0) { // -r region, no bed: set up region iterator
+			hts_idx_t *tmp = sam_index_load(data[i]->fp, a->filenames[i]);
+			if (tmp) {
+				data[i]->itr = bam_itr_queryi(tmp, a->tid, a->beg, a->end);
+				hts_idx_destroy(tmp);
+			}
+		}
+	}
+
+	int site_beg = a->beg, site_end = a->end;
+	int niter = a->nsites > 0? a->si_end : a->si_beg + 1; // si_beg+1 for the nsites==0 single pass
+	for (int si = a->si_beg; si < niter; ++si) {
+		if (a->nsites > 0) {
+			int site_tid_val = a->sites[si].tid;
+			site_beg = a->sites[si].beg;
+			site_end = a->sites[si].end;
+			if (last_tid != site_tid_val) {
+				if (fai) { free(ref); ref = fai_fetch(fai, a->h->target_name[site_tid_val], &l_ref); }
+				last_tid = site_tid_val;
+				pa.len = 0;
+			}
+			for (i = 0; i < n; ++i) {
+				if (data[i]->itr) { bam_itr_destroy(data[i]->itr); data[i]->itr = NULL; }
+				if (idx[i]) data[i]->itr = bam_itr_queryi(idx[i], site_tid_val, site_beg, site_end);
+			}
+		}
+		mplp = bam_mplp_init(n, read_bam, (void**)data);
+		while (bam_mplp_auto(mplp, &tid, &pos, n_plp, plp) > 0) {
+			if (pos < site_beg || pos >= site_end) continue;
+			if (a->bed && !bed_overlap(a->bed, a->h->target_name[tid], pos, pos + 1)) continue;
+			for (i = pa.tot_dp = 0; i < n; ++i) pa.tot_dp += n_plp[i];
+			if (last_tid != tid) {
+				if (fai) { // switch of chromosomes
+					free(ref);
+					ref = fai_fetch(fai, a->h->target_name[tid], &l_ref);
+				}
+				last_tid = tid; pa.len = 0;
+			}
+			if (pa.tot_dp) {
+			int k, r = 15, shift = 0, qual;
+			allele_t *al;
+			if (pa.tot_dp + 1 > pa.max_dp) { // expand array
+				pa.max_dp = pa.tot_dp + 1;
+				kroundup32(pa.max_dp);
+				pa.a = (allele_t*)realloc(pa.a, pa.max_dp * sizeof(allele_t));
+			}
+			al = pa.a;
+			// collect alleles; ref is fetched per full chromosome so offset is just pos
+			r = (ref && pos < l_ref)? seq_nt16_table[(int)ref[pos]] : 15;
+			for (i = pa.n_a = 0; i < n; ++i)
+				for (j = 0; j < n_plp[i]; ++j) {
+					al[pa.n_a] = pileup2allele(&plp[i][j], a->baseQ, (uint64_t)i<<32 | j, r, a->trim_len, a->del_as_allele);
+					if (!al[pa.n_a].is_skip) ++pa.n_a;
+				}
+			if (pa.n_a == 0) continue; // no reads are good enough; zero effective coverage
+			// count alleles
+			ks_introsort(allele, pa.n_a, pa.a);
+			count_alleles(&pa, n);
+			// squeeze out weak alleles
+			for (i = k = 0; i < pa.n_a; ++i)
+				if (pa.support[al[i].k] >= a->min_support && pa.support[al[i].k] >= pa.n_a * a->min_af
+					&& pa.support_strand[al[i].k<<1] >= a->min_support_strand && pa.support_strand[al[i].k<<1|1] >= a->min_support_strand)
+				{
+					al[k++] = al[i];
+				}
+			if (k < pa.n_a) {
+				if (k == 0) continue; // no alleles are good enough
+				pa.n_a = k;
+				count_alleles(&pa, n);
+			}
+
+			if (a->var_only && pa.n_alleles == 1 && al[0].hash>>63 == 0) continue; // var_only mode, but no ALT allele; skip
+			if (a->var_only && pa.n_alleles <= 2 && a->del_as_allele) {
+				int n_ref = 0, n_del = 0;
+				for (i = 0; i < pa.n_a; ++i)
+					if (al[i].is_del) ++n_del;
+					else if (al[i].hash>>63 == 0) ++n_ref;
+				if (n_ref + n_del == pa.n_a) continue;
+			}
+			// print VCF or allele summary
+			fputs(a->h->target_name[tid], out); fprintf(out, "\t%d", pos+1);
+			if (a->is_vcf) {
+				fputs("\t.\t", out);
+				for (i = 0; i <= pa.max_del; ++i) // print the reference allele up to the longest deletion
+					fputc(ref && pos + i < l_ref? ref[pos + i] : 'N', out);
+				fputc('\t', out);
+			} else fprintf(out, "\t%c\t", ref && pos < l_ref? ref[pos] : 'N');
+			// print alleles
+			if (!a->is_vcf || al[0].hash>>63) { // print if there is no reference allele
+				print_allele(out, &plp[al[0].pos>>32][(uint32_t)al[0].pos], l_ref, ref, pos, pa.max_del, a->is_vcf, a->del_as_allele);
+				if (pa.n_alleles > 1) fputc(',', out);
+			}
+			for (i = k = 1; i < pa.n_a; ++i)
+				if (al[i].indel != al[i-1].indel || al[i].hash != al[i-1].hash) {
+					print_allele(out, &plp[al[i].pos>>32][(uint32_t)al[i].pos], l_ref, ref, pos, pa.max_del, a->is_vcf, a->del_as_allele);
+					if (++k != pa.n_alleles) fputc(',', out);
+				}
+			if (a->is_vcf && pa.n_alleles == 1 && al[0].hash>>63 == 0) fputc('.', out); // print placeholder if there is only the reference allele
+			// compute and print qual
+			for (i = !(al[0].hash>>63), qual = 0; i < pa.n_alleles; ++i)
+				qual = qual > pa.support[i]? qual : pa.support[i];
+			if (a->is_vcf) fprintf(out, "\t%d\t.\t.\tGT:%s", qual, a->show_2strand? "ADF:ADR" : "AD");
+			// print counts
+			shift = (a->is_vcf && al[0].hash>>63); // in VCF, if there is no ref allele, we need to shift the allele number
+			for (i = k = 0; i < n; ++i, k += pa.n_alleles) {
+				int max1 = 0, max2 = 0, a1 = -1, a2 = -1, *sum_q = &pa.cnt_supp[k];
+				// estimate genotype
+				for (j = 0; j < pa.n_alleles; ++j)
+					if (sum_q[j] > max1) max2 = max1, a2 = a1, max1 = sum_q[j], a1 = j;
+					else if (sum_q[j] > max2) max2 = sum_q[j], a2 = j;
+				if (max1 == 0 || (a->min_support > 0 && max1 < a->min_support)) a1 = a2 = -1;
+				else if (max2 == 0 || (a->min_support > 0 && max2 < a->min_support)) a2 = a1;
+				// turn the genotype to homozygous if min_af is set and the minor allele does not have high enough frequency
+				if (a->min_af > 0.0 && a->min_af < 0.5 && a1 >= 0 && a2 >= 0 && a1 != a2 && max2 < (max1 + max2) * a->min_af)
+					a1 = a2;
+				// print genotypes
+				if (a1 < 0) fprintf(out, "\t./.:");
+				else fprintf(out, "\t%d/%d:", a1 + shift, a2 + shift);
+				// print counts
+				if (a->show_2strand) {
+					if (shift) fputs("0,", out);
+					for (j = 0; j < pa.n_alleles; ++j) {
+						if (j) fputc(',', out);
+						fprintf(out, "%d", pa.cnt_strand[(k+j)<<1]);
+					}
+					fputc(':', out);
+					if (shift) fputs("0,", out);
+					for (j = 0; j < pa.n_alleles; ++j) {
+						if (j) fputc(',', out);
+						fprintf(out, "%d", pa.cnt_strand[(k+j)<<1|1]);
+					}
+				} else {
+					if (shift) fputs("0,", out);
+					for (j = 0; j < pa.n_alleles; ++j) {
+						if (j) fputc(',', out);
+						fprintf(out, "%d", pa.cnt_supp[k+j]);
+					}
+				}
+			} // ~for(i)
+			fputc('\n', out);
+		} // ~if(pa.tot_dp)
+		} // ~while()
+		bam_mplp_destroy(mplp);
+	} // ~for(si)
+
+	// cleanup
+	free(n_plp); free(plp);
+	free(pa.cnt_strand); free(pa.cnt_supp); free(pa.a); free(pa.seq);
+	for (i = 0; i < n; ++i) {
+		hts_close(data[i]->fp);
+		if (data[i]->itr) bam_itr_destroy(data[i]->itr);
+		if (idx[i]) hts_idx_destroy(idx[i]);
+		free(data[i]);
+	}
+	free(data); free(idx);
+	if (ref) free(ref);
+	if (fai) fai_destroy(fai);
+}
+
+static void *worker(void *arg) { process_sites((thread_arg_t*)arg); return NULL; }
+
 int main(int argc, char *argv[])
 {
-	int i, j, n, tid, beg, end, pos, *n_plp, baseQ = 0, mapQ = 0, min_len = 0, l_ref = 0, min_support = 1, min_support_strand = 0, min_supp_len = 0;
-	int is_vcf = 0, var_only = 0, show_2strand = 0, trim_len = 0, del_as_allele = 0, proper_only = 0;
-	int last_tid;
-	int si = 0, site_beg = 0, site_end = 1<<30, nsites = 0;
-	hts_idx_t **idx = NULL;
+	int i, n, tid, beg, end;
+	int baseQ = 0, mapQ = 0, min_len = 0, min_support = 1, min_support_strand = 0, min_supp_len = 0;
+	int is_vcf = 0, var_only = 0, show_2strand = 0, trim_len = 0, del_as_allele = 0, proper_only = 0, nthreads = 1;
+	int nsites = 0;
 	bed_site_t *sites = NULL;
 	double min_af = 0.0;
-	const bam_pileup1_t **plp;
-	char *ref = 0, *reg = 0, *chr_end; // specified region
+	char *reg = 0, *chr_end; // specified region
 	char *fname = 0; // reference fasta
 	faidx_t *fai = 0;
 	sam_hdr_t *h = 0; // header of the 1st input
-	aux_t **data;
-	paux_t aux;
-	bam_mplp_t mplp;
 	void *bed = 0;
 	ketopt_t o = KETOPT_INIT;
 
 	// parse the command line
-	while ((n = ketopt(&o, argc, argv, 1, "r:q:Q:l:f:p:vcCS:s:b:x:T:ea:yVP", 0)) >= 0) {
+	while ((n = ketopt(&o, argc, argv, 1, "r:q:Q:l:f:p:vcCS:s:b:x:T:ea:yVPt:", 0)) >= 0) {
 		if (n == 'f') { fname = o.arg; fai = fai_load(fname); }
 		else if (n == 'b') { if (bed) bed_destroy(bed); bed = bed_read(o.arg); }
 		else if (n == 'x') { if (bed) bed_destroy(bed); bed = bed_read_vcf(o.arg); }
@@ -214,6 +432,7 @@ int main(int argc, char *argv[])
 		else if (n == 'e') del_as_allele = 1;
 		else if (n == 'p') min_af = atof(o.arg);
 		else if (n == 'P') proper_only = 1;
+		else if (n == 't') nthreads = atoi(o.arg);
 		else if (n == 'y') mapQ = 20, baseQ = 20, min_support = 5, min_support_strand = 2, is_vcf = var_only = show_2strand = 1;
 		else if (n == 'V') {
 			puts(VERSION);
@@ -240,6 +459,7 @@ int main(int argc, char *argv[])
 		fprintf(stderr, "    -r STR       region in format of 'ctg:start-end' [null]\n");
 		fprintf(stderr, "    -b FILE      BED or position list file to include [null]\n");
 		fprintf(stderr, "    -x FILE      VCF/BCF of target sites; restrict pileup to these positions [null]\n");
+		fprintf(stderr, "    -t INT       number of threads [1]\n");
 		fprintf(stderr, "    -P           only consider properly paired reads for paired-end reads\n");
 		fprintf(stderr, "    -q INT       minimum mapping quality [%d]\n", mapQ);
 		fprintf(stderr, "    -l INT       minimum alignment length [%d]\n", min_len);
@@ -253,64 +473,35 @@ int main(int argc, char *argv[])
 		return 1;
 	}
 
-	// initialize the auxiliary data structures
-	n = argc - o.ind; // the number of BAMs on the command line
-	data = (aux_t**)calloc(n, sizeof(aux_t*)); // data[i] for the i-th input
-	idx = (hts_idx_t**)calloc(n, sizeof(hts_idx_t*));
-	beg = 0; end = 1<<30; tid = -1;  // set the default region
-	if (reg) {
-		chr_end = (char*)hts_parse_reg(reg, &beg, &end);
-		ref = fai? fai_fetch(fai, reg, &l_ref) : 0;
-	} else chr_end = 0;
-
-	// load the index or put the file position at the right place
-	last_tid = -1;
-	for (i = 0; i < n; ++i) {
-		sam_hdr_t *htmp;
-		data[i] = (aux_t*)calloc(1, sizeof(aux_t));
-		data[i]->fp = hts_open(argv[o.ind+i], "r"); // open BAM/CRAM/SAM
-		if (fname) hts_set_fai_filename(data[i]->fp, fname); // reference for CRAM decoding
-		data[i]->min_mapQ = mapQ;
-		data[i]->min_len  = min_len;
-		data[i]->min_supp_len = min_supp_len;
-		data[i]->proper_only = proper_only;
-		data[i]->bed = bed;
-		htmp = sam_hdr_read(data[i]->fp);
-		if (i == 0 && chr_end) {
-			char c = *chr_end;
-			*chr_end = 0;
-			last_tid = tid = bam_name2id(htmp, reg);
-			*chr_end = c;
-		}
-		if (i) sam_hdr_destroy(htmp); // if not the 1st file, trash the header
-		else h = htmp; // keep the header of the 1st file
-		if (tid >= 0) { // -r region specified: single-region indexed access
-			idx[i] = sam_index_load(data[i]->fp, argv[o.ind+i]);
-			if (idx[i]) {
-				data[i]->itr = bam_itr_queryi(idx[i], tid, beg, end);
-				hts_idx_destroy(idx[i]);
-				idx[i] = NULL;
+	// open the first file to read the shared header; threads will reopen all files
+	n = argc - o.ind;
+	beg = 0; end = 1<<30; tid = -1;
+	{
+		htsFile *fp0 = hts_open(argv[o.ind], "r");
+		if (fname) hts_set_fai_filename(fp0, fname);
+		h = sam_hdr_read(fp0);
+		if (reg) {
+			chr_end = (char*)hts_parse_reg(reg, &beg, &end);
+			if (chr_end) {
+				char c = *chr_end; *chr_end = 0;
+				tid = bam_name2id(h, reg);
+				*chr_end = c;
 			}
-		} else if (bed) { // bed/vcf: keep index alive for per-site iteration
-			idx[i] = sam_index_load(data[i]->fp, argv[o.ind+i]);
 		}
-		data[i]->h = h;
+		hts_close(fp0);
 	}
-	if (bed && tid < 0)
-		sites = bed_get_sorted_sites(bed, h, &nsites);
 
-	// the core multi-pileup loop
-	n_plp = (int*)calloc(n, sizeof(int));
-	plp = (const bam_pileup1_t**)calloc(n, sizeof(const bam_pileup1_t*));
-	memset(&aux, 0, sizeof(paux_t));
+	if (bed) sites = bed_get_sorted_sites(bed, h, &nsites);
+
+	// print VCF header (main thread only, before workers start)
 	if (is_vcf) {
 		puts("##fileformat=VCFv4.2");
 		printf("##source=minipileup-%s\n", VERSION);
 		if (fai) {
 			printf("##reference=%s\n", fname);
-			int i, n = faidx_nseq(fai);
-			for (i=0; i<n; i++) {
-				const char *seq = faidx_iseq(fai,i);
+			int ni, nn = faidx_nseq(fai);
+			for (ni = 0; ni < nn; ni++) {
+				const char *seq = faidx_iseq(fai, ni);
 				int len = faidx_seq_len(fai, seq);
 				printf("##contig=<ID=%s,length=%d>\n", seq, len);
 			}
@@ -324,155 +515,65 @@ int main(int argc, char *argv[])
 		for (i = 0; i < n; ++i) printf("\t%s", argv[o.ind+i]);
 		putchar('\n');
 	}
-	site_beg = beg; site_end = end;
-	for (si = 0; si < (nsites > 0 ? nsites : 1); ++si) {
-		if (nsites > 0) {
-			int site_tid_val = sites[si].tid;
-			site_beg = sites[si].beg;
-			site_end = sites[si].end;
-			if (last_tid != site_tid_val) {
-				if (fai) { free(ref); ref = fai_fetch(fai, h->target_name[site_tid_val], &l_ref); }
-				last_tid = site_tid_val;
-				aux.len = 0;
-			}
-			for (i = 0; i < n; ++i) {
-				if (data[i]->itr) { bam_itr_destroy(data[i]->itr); data[i]->itr = NULL; }
-				if (idx[i]) data[i]->itr = bam_itr_queryi(idx[i], site_tid_val, site_beg, site_end);
-			}
-		}
-		mplp = bam_mplp_init(n, read_bam, (void**)data);
-		while (bam_mplp_auto(mplp, &tid, &pos, n_plp, plp) > 0) {
-			if (pos < site_beg || pos >= site_end) continue;
-			if (bed && !bed_overlap(bed, h->target_name[tid], pos, pos + 1)) continue;
-			for (i = aux.tot_dp = 0; i < n; ++i) aux.tot_dp += n_plp[i];
-			if (last_tid != tid) {
-				if (fai) { // switch of chromosomes
-					free(ref);
-					ref = fai_fetch(fai, h->target_name[tid], &l_ref);
-				}
-				last_tid = tid; aux.len = 0;
-			}
-			if (aux.tot_dp) {
-			int k, r = 15, shift = 0, qual;
-			allele_t *a;
-			if (aux.tot_dp + 1 > aux.max_dp) { // expand array
-				aux.max_dp = aux.tot_dp + 1;
-				kroundup32(aux.max_dp);
-				aux.a = (allele_t*)realloc(aux.a, aux.max_dp * sizeof(allele_t));
-			}
-			a = aux.a;
-			// collect alleles
-			r = (ref && pos - beg < l_ref)? seq_nt16_table[(int)ref[pos - beg]] : 15; // the reference allele
-			for (i = aux.n_a = 0; i < n; ++i)
-				for (j = 0; j < n_plp[i]; ++j) {
-					a[aux.n_a] = pileup2allele(&plp[i][j], baseQ, (uint64_t)i<<32 | j, r, trim_len, del_as_allele);
-					if (!a[aux.n_a].is_skip) ++aux.n_a;
-				}
-			if (aux.n_a == 0) continue; // no reads are good enough; zero effective coverage
-			// count alleles
-			ks_introsort(allele, aux.n_a, aux.a);
-			count_alleles(&aux, n);
-			// squeeze out weak alleles
-			for (i = k = 0; i < aux.n_a; ++i)
-				if (aux.support[a[i].k] >= min_support && aux.support[a[i].k] >= aux.n_a * min_af
-					&& aux.support_strand[a[i].k<<1] >= min_support_strand && aux.support_strand[a[i].k<<1|1] >= min_support_strand)
-				{
-					a[k++] = a[i];
-				}
-			if (k < aux.n_a) {
-				if (k == 0) continue; // no alleles are good enough
-				aux.n_a = k;
-				count_alleles(&aux, n);
-			}
 
-			if (var_only && aux.n_alleles == 1 && a[0].hash>>63 == 0) continue; // var_only mode, but no ALT allele; skip
-			if (var_only && aux.n_alleles <= 2 && del_as_allele) {
-				int n_ref = 0, n_del = 0;
-				for (i = 0; i < aux.n_a; ++i)
-					if (a[i].is_del) ++n_del;
-					else if (a[i].hash>>63 == 0) ++n_ref;
-				if (n_ref + n_del == aux.n_a) continue;
-			}
-			// print VCF or allele summary
-			fputs(h->target_name[tid], stdout); printf("\t%d", pos+1);
-			if (is_vcf) {
-				fputs("\t.\t", stdout);
-				for (i = 0; i <= aux.max_del; ++i) // print the reference allele up to the longest deletion
-					putchar(ref && pos + i < l_ref + beg? ref[pos + i - beg] : 'N');
-				putchar('\t');
-			} else printf("\t%c\t", ref && pos < l_ref + beg? ref[pos - beg] : 'N'); // print a single reference base
-																					 // print alleles
-			if (!is_vcf || a[0].hash>>63) { // print if there is no reference allele
-				print_allele(&plp[a[0].pos>>32][(uint32_t)a[0].pos], l_ref, ref, pos - beg, aux.max_del, is_vcf, del_as_allele);
-				if (aux.n_alleles > 1) putchar(',');
-			}
-			for (i = k = 1; i < aux.n_a; ++i)
-				if (a[i].indel != a[i-1].indel || a[i].hash != a[i-1].hash) {
-					print_allele(&plp[a[i].pos>>32][(uint32_t)a[i].pos], l_ref, ref, pos - beg, aux.max_del, is_vcf, del_as_allele);
-					if (++k != aux.n_alleles) putchar(',');
-				}
-			if (is_vcf && aux.n_alleles == 1 && a[0].hash>>63 == 0) putchar('.'); // print placeholder if there is only the reference allele
-			// compute and print qual
-			for (i = !(a[0].hash>>63), qual = 0; i < aux.n_alleles; ++i)
-				qual = qual > aux.support[i]? qual : aux.support[i];
-			if (is_vcf) printf("\t%d\t.\t.\tGT:%s", qual, show_2strand? "ADF:ADR" : "AD");
-			// print counts
-			shift = (is_vcf && a[0].hash>>63); // in VCF, if there is no ref allele, we need to shift the allele number
-			for (i = k = 0; i < n; ++i, k += aux.n_alleles) {
-				int max1 = 0, max2 = 0, a1 = -1, a2 = -1, *sum_q = &aux.cnt_supp[k];
-				// estimate genotype
-				for (j = 0; j < aux.n_alleles; ++j)
-					if (sum_q[j] > max1) max2 = max1, a2 = a1, max1 = sum_q[j], a1 = j;
-					else if (sum_q[j] > max2) max2 = sum_q[j], a2 = j;
-				if (max1 == 0 || (min_support > 0 && max1 < min_support)) a1 = a2 = -1;
-				else if (max2 == 0 || (min_support > 0 && max2 < min_support)) a2 = a1;
-				// turn the genotype to homozygous if min_af is set and the minor allele does not high enough frequency
-				if (min_af > 0.0 && min_af < 0.5 && a1 >= 0 && a2 >= 0 && a1 != a2 && max2 < (max1 + max2) * min_af)
-					a1 = a2;
-				// print genotypes
-				if (a1 < 0) printf("\t./.:");
-				else printf("\t%d/%d:", a1 + shift, a2 + shift);
-				// print counts
-				if (show_2strand) {
-					if (shift) fputs("0,", stdout);
-					for (j = 0; j < aux.n_alleles; ++j) {
-						if (j) putchar(',');
-						printf("%d", aux.cnt_strand[(k+j)<<1]);
-					}
-					putchar(':');
-					if (shift) fputs("0,", stdout);
-					for (j = 0; j < aux.n_alleles; ++j) {
-						if (j) putchar(',');
-						printf("%d", aux.cnt_strand[(k+j)<<1|1]);
-					}
-				} else {
-					if (shift) fputs("0,", stdout);
-					for (j = 0; j < aux.n_alleles; ++j) {
-						if (j) putchar(',');
-						printf("%d", aux.cnt_supp[k+j]);
-					}
-				}
-			} // ~for(i)
-			putchar('\n');
-		} // ~if(aux.tot_dp)
-		} // ~while()
-		bam_mplp_destroy(mplp);
-	} // ~for(si)
-	free(n_plp); free(plp); free(sites);
+	// decide actual thread count: only parallelize when we have discrete sites to split
+	int nt = (nthreads > 1 && nsites > 1)? nthreads : 1;
+	if (nt > nsites && nsites > 0) nt = nsites;
+
+	thread_arg_t *targs = (thread_arg_t*)calloc(nt, sizeof(thread_arg_t));
+	for (i = 0; i < nt; ++i) {
+		targs[i].n_files    = n;
+		targs[i].filenames  = argv + o.ind;
+		targs[i].fname_ref  = fname;
+		targs[i].h          = h;
+		targs[i].bed        = bed;
+		targs[i].sites      = sites;
+		targs[i].nsites     = nsites;
+		targs[i].si_beg     = (nsites > 0)? i * nsites / nt       : 0;
+		targs[i].si_end     = (nsites > 0)? (i+1) * nsites / nt   : 1;
+		targs[i].tid        = tid;
+		targs[i].beg        = beg;
+		targs[i].end        = end;
+		targs[i].baseQ      = baseQ;
+		targs[i].mapQ       = mapQ;
+		targs[i].min_len    = min_len;
+		targs[i].min_supp_len = min_supp_len;
+		targs[i].proper_only  = proper_only;
+		targs[i].is_vcf       = is_vcf;
+		targs[i].var_only     = var_only;
+		targs[i].show_2strand = show_2strand;
+		targs[i].trim_len     = trim_len;
+		targs[i].del_as_allele = del_as_allele;
+		targs[i].min_support  = min_support;
+		targs[i].min_support_strand = min_support_strand;
+		targs[i].min_af       = min_af;
+		if (nt > 1)
+			targs[i].out = open_memstream(&targs[i].out_buf, &targs[i].out_len);
+		else
+			targs[i].out = stdout;
+	}
+
+	if (nt == 1) {
+		process_sites(&targs[0]);
+	} else {
+		pthread_t *threads = (pthread_t*)calloc(nt, sizeof(pthread_t));
+		for (i = 0; i < nt; ++i)
+			pthread_create(&threads[i], NULL, worker, &targs[i]);
+		for (i = 0; i < nt; ++i) {
+			pthread_join(threads[i], NULL);
+			fclose(targs[i].out);
+			if (targs[i].out_len > 0)
+				fwrite(targs[i].out_buf, 1, targs[i].out_len, stdout);
+			free(targs[i].out_buf);
+		}
+		free(threads);
+	}
+	free(targs);
 
 	sam_hdr_destroy(h);
-	for (i = 0; i < n; ++i) {
-		hts_close(data[i]->fp);
-		if (data[i]->itr) bam_itr_destroy(data[i]->itr);
-		if (idx && idx[i]) hts_idx_destroy(idx[i]);
-		free(data[i]);
-	}
-	free(idx);
-	if (ref) free(ref);
 	if (fai) fai_destroy(fai);
-	free(aux.cnt_strand); free(aux.cnt_supp); free(aux.a);
-	free(aux.seq);
-	free(data); free(reg);
+	free(sites);
+	free(reg);
 	if (bed) bed_destroy(bed);
 
 	fprintf(stderr, "[M::%s] Version: %s\n", __func__, VERSION);

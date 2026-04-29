@@ -162,17 +162,33 @@ PYEOF
 echo ""
 
 # --------------------------------------------------------------------------
-# Step 4: minipileup2 (full CRAMs + subset VCF, indexed access)
+# Step 4: minipileup2 single-thread (full CRAMs + subset VCF, indexed access)
 # --------------------------------------------------------------------------
-echo "=== Step 4: minipileup2 (two CRAMs + VCF indexed) ==="
+echo "=== Step 4a: minipileup2 single-thread (two CRAMs + VCF indexed) ==="
 T0=$(date +%s%N)
 "$MP2" -f "$REF" $MINPILEUP_ARGS -x "$TESTDIR/sites.vcf.gz" "$CRAM1" "$CRAM2" \
-    2>"$TESTDIR/log_mp2.txt" \
-    | grep -v '^#' > "$TESTDIR/out_mp2.txt"
+    2>"$TESTDIR/log_mp2_t1.txt" \
+    | grep -v '^#' > "$TESTDIR/out_mp2_t1.txt"
 T1=$(date +%s%N)
 echo "Time: $(( (T1 - T0) / 1000000 )) ms"
-echo "Output lines: $(wc -l < "$TESTDIR/out_mp2.txt")"
+echo "Output lines: $(wc -l < "$TESTDIR/out_mp2_t1.txt")"
 echo ""
+
+# --------------------------------------------------------------------------
+# Step 4b: minipileup2 multi-thread (same input, -t 4)
+# --------------------------------------------------------------------------
+echo "=== Step 4b: minipileup2 multi-thread -t 4 (two CRAMs + VCF indexed) ==="
+T0=$(date +%s%N)
+"$MP2" -t 4 -f "$REF" $MINPILEUP_ARGS -x "$TESTDIR/sites.vcf.gz" "$CRAM1" "$CRAM2" \
+    2>"$TESTDIR/log_mp2_t4.txt" \
+    | grep -v '^#' > "$TESTDIR/out_mp2_t4.txt"
+T1=$(date +%s%N)
+echo "Time: $(( (T1 - T0) / 1000000 )) ms"
+echo "Output lines: $(wc -l < "$TESTDIR/out_mp2_t4.txt")"
+echo ""
+
+# Use single-thread output as the canonical mp2 result for cross-tool comparison
+cp "$TESTDIR/out_mp2_t1.txt" "$TESTDIR/out_mp2.txt"
 
 # --------------------------------------------------------------------------
 # Step 5: Normalise each tool's output to: chr pos ref alt sample rf af rr ar
@@ -203,17 +219,20 @@ extract_counts() {
     }' "$infile" | sort > "$outfile"
 }
 
-extract_counts "$TESTDIR/out_mp1.txt" "$TESTDIR/norm_mp1.txt"
-extract_counts "$TESTDIR/out_smp.txt" "$TESTDIR/norm_smp.txt"
-extract_counts "$TESTDIR/out_mp2.txt" "$TESTDIR/norm_mp2.txt"
+extract_counts "$TESTDIR/out_mp1.txt"      "$TESTDIR/norm_mp1.txt"
+extract_counts "$TESTDIR/out_smp.txt"      "$TESTDIR/norm_smp.txt"
+extract_counts "$TESTDIR/out_mp2_t1.txt"   "$TESTDIR/norm_mp2_t1.txt"
+extract_counts "$TESTDIR/out_mp2_t4.txt"   "$TESTDIR/norm_mp2_t4.txt"
+cp "$TESTDIR/norm_mp2_t1.txt" "$TESTDIR/norm_mp2.txt"
 
-echo "  mp1 entries: $(wc -l < "$TESTDIR/norm_mp1.txt")"
-echo "  smp entries: $(wc -l < "$TESTDIR/norm_smp.txt")"
-echo "  mp2 entries: $(wc -l < "$TESTDIR/norm_mp2.txt")"
+echo "  mp1 entries:    $(wc -l < "$TESTDIR/norm_mp1.txt")"
+echo "  smp entries:    $(wc -l < "$TESTDIR/norm_smp.txt")"
+echo "  mp2 t1 entries: $(wc -l < "$TESTDIR/norm_mp2_t1.txt")"
+echo "  mp2 t4 entries: $(wc -l < "$TESTDIR/norm_mp2_t4.txt")"
 echo ""
 
 # --------------------------------------------------------------------------
-# Step 6: 3-way comparison (Python, (chr,pos,ref,alt,sample) key)
+# Step 6: Comparisons
 # --------------------------------------------------------------------------
 echo "=== Step 6: Comparison ==="
 
@@ -280,24 +299,34 @@ def compare(a, a_pos, b, b_pos, name_a, name_b):
     return len(truly_only_a), len(truly_only_b), match, len(shared)
 
 testdir = sys.argv[1]
-mp1, mp1p = load_norm(os.path.join(testdir, 'norm_mp1.txt'))
-mp2, mp2p = load_norm(os.path.join(testdir, 'norm_mp2.txt'))
-smp, smpp = load_norm(os.path.join(testdir, 'norm_smp.txt'))
+mp1,    mp1p    = load_norm(os.path.join(testdir, 'norm_mp1.txt'))
+mp2_t1, mp2_t1p = load_norm(os.path.join(testdir, 'norm_mp2_t1.txt'))
+mp2_t4, mp2_t4p = load_norm(os.path.join(testdir, 'norm_mp2_t4.txt'))
+smp,    smpp    = load_norm(os.path.join(testdir, 'norm_smp.txt'))
 
-print("--- mp1 vs mp2 ---")
-o1, o2, match, shared = compare(mp1, mp1p, mp2, mp2p, "mp1", "mp2")
+print("--- mp2 t=1 vs mp2 t=4 (threading consistency) ---")
+ot1, ot4, mt_match, mt_shared = compare(mp2_t1, mp2_t1p, mp2_t4, mp2_t4p, "mp2_t1", "mp2_t4")
+print()
+print("--- mp1 vs mp2 (t=1) ---")
+o1, o2, match, shared = compare(mp1, mp1p, mp2_t1, mp2_t1p, "mp1", "mp2_t1")
 print()
 print("--- mp1 vs samtools mpileup ---")
 compare(mp1, mp1p, smp, smpp, "mp1", "smp")
 print()
-print("--- mp2 vs samtools mpileup ---")
-compare(mp2, mp2p, smp, smpp, "mp2", "smp")
+print("--- mp2 (t=1) vs samtools mpileup ---")
+compare(mp2_t1, mp2_t1p, smp, smpp, "mp2_t1", "smp")
 print()
 print("Full output files:", testdir)
 print()
 print("=== SUMMARY ===")
-if o1 == 0 and o2 == 0 and match == shared:
-    print("PASS: minipileup and minipileup2 produce identical counts.")
+thread_ok = (ot1 == 0 and ot4 == 0 and mt_match == mt_shared)
+mp_ok     = (o1  == 0 and o2  == 0 and match    == shared)
+if thread_ok:
+    print("PASS (threading): mp2 t=1 and mp2 t=4 produce identical counts.")
 else:
-    print(f"FAIL: minipileup and minipileup2 differ (only_mp1={o1}, only_mp2={o2}, match={match}/{shared}).")
+    print(f"FAIL (threading): mp2 t=1 and mp2 t=4 differ (only_t1={ot1}, only_t4={ot4}, match={mt_match}/{mt_shared}).")
+if mp_ok:
+    print("PASS (cross-tool): minipileup and minipileup2 produce identical counts.")
+else:
+    print(f"FAIL (cross-tool): minipileup and minipileup2 differ (only_mp1={o1}, only_mp2={o2}, match={match}/{shared}).")
 PYEOF
