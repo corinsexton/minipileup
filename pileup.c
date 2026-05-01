@@ -79,6 +79,46 @@ typedef struct {
 #define allele_lt(a, b) ((a).hash < (b).hash || ((a).hash == (b).hash && (a).indel < (b).indel))
 KSORT_INIT(allele, allele_t, allele_lt)
 
+#define uint64_lt(a, b) ((a) < (b))
+KSORT_INIT(uint64, uint64_t, uint64_lt)
+
+static inline int is_proper_same_chrom(const bam_pileup1_t *p)
+{
+	uint32_t f = p->b->core.flag;
+	return (f & BAM_FPAIRED) && (f & BAM_FPROPER_PAIR) &&
+	       !(f & BAM_FMUNMAP) && p->b->core.tid == p->b->core.mtid;
+}
+
+static inline uint64_t pair_fingerprint(const bam_pileup1_t *p)
+{
+	int32_t a = p->b->core.pos, b = p->b->core.mpos;
+	return a <= b ? (uint64_t)(uint32_t)a << 32 | (uint32_t)b
+	              : (uint64_t)(uint32_t)b << 32 | (uint32_t)a;
+}
+
+// fp_used encodes two bits per slot:
+//   bit 0 (value 1): skip decision — 0=keep (first of pair), 1=skip (second of pair)
+//   bit 1 (value 2): consumed — set when the slot is assigned to a read in the main loop
+//
+// Returns 1 (skip this read) or 0 (count this read).
+// Finds the first unconsumed slot for fp and returns its skip decision.
+static inline int fp_seen_before(uint64_t *fp_buf, uint8_t *fp_used, int n_fp, uint64_t fp)
+{
+	int lo = 0, hi = n_fp;
+	while (lo < hi) {
+		int mid = (lo + hi) >> 1;
+		if (fp_buf[mid] < fp) lo = mid + 1;
+		else hi = mid;
+	}
+	if (lo >= n_fp || fp_buf[lo] != fp) return 0;
+	// advance past already-consumed slots for this fingerprint
+	while (lo < n_fp && fp_buf[lo] == fp && (fp_used[lo] & 2)) ++lo;
+	if (lo >= n_fp || fp_buf[lo] != fp) return 0;
+	int skip = fp_used[lo] & 1; // pre-computed skip decision for this slot
+	fp_used[lo] |= 2;           // mark consumed
+	return skip;
+}
+
 static inline allele_t pileup2allele(const bam_pileup1_t *p, int min_baseQ, uint64_t pos, int ref, int trim_len, int del_as_allele)
 { // collect allele information given a pileup1 record
 	allele_t a;
@@ -141,6 +181,9 @@ typedef struct {
 	int *support, *support_strand; // support across entire $a. It points to the last "row" of cnt_supp/cnt_strand
 	int len, max_len;
 	char *seq;
+	uint64_t *fp_buf;  // pair fingerprint buffer for overlap deduplication
+	uint8_t  *fp_used; // which fingerprint slots have been claimed this column
+	int max_fp;
 } paux_t;
 
 static void count_alleles(paux_t *pa, int n)
@@ -195,6 +238,7 @@ typedef struct {
 	int baseQ, mapQ, min_len, min_supp_len, proper_only;
 	int is_vcf, var_only, show_2strand, trim_len, del_as_allele;
 	int min_support, min_support_strand;
+	int dedup_overlap; // -D: deduplicate overlapping paired-end reads
 	double min_af;
 	// output: written here by the thread; main flushes to stdout in order
 	FILE *out;
@@ -276,19 +320,45 @@ static void process_sites(thread_arg_t *a)
 				last_tid = tid; pa.len = 0;
 			}
 			if (pa.tot_dp) {
-			int k, r = 15, shift = 0, qual;
+			int k, r = 15, shift = 0, qual, n_fp = 0;
 			allele_t *al;
 			if (pa.tot_dp + 1 > pa.max_dp) { // expand array
 				pa.max_dp = pa.tot_dp + 1;
 				kroundup32(pa.max_dp);
 				pa.a = (allele_t*)realloc(pa.a, pa.max_dp * sizeof(allele_t));
 			}
+			if (a->dedup_overlap && pa.tot_dp + 1 > pa.max_fp) {
+				pa.max_fp = pa.tot_dp + 1;
+				kroundup32(pa.max_fp);
+				pa.fp_buf  = (uint64_t*)realloc(pa.fp_buf,  pa.max_fp * sizeof(uint64_t));
+				pa.fp_used = (uint8_t*)realloc(pa.fp_used,  pa.max_fp * sizeof(uint8_t));
+			}
 			al = pa.a;
 			// collect alleles; ref is fetched per full chromosome so offset is just pos
 			r = (ref && pos < l_ref)? seq_nt16_table[(int)ref[pos]] : 15;
+			if (a->dedup_overlap) {
+				// pre-pass: build sorted fingerprint table of all proper paired reads in this column
+				for (i = 0; i < n; ++i)
+					for (j = 0; j < n_plp[i]; ++j)
+						if (is_proper_same_chrom(&plp[i][j]))
+							pa.fp_buf[n_fp++] = pair_fingerprint(&plp[i][j]);
+				ks_introsort(uint64, n_fp, pa.fp_buf);
+				// assign alternating skip decisions within each run of identical fingerprints:
+				// even positions (0, 2, 4, ...) = keep (bit 0 = 0)
+				// odd positions  (1, 3, 5, ...) = skip (bit 0 = 1)
+				uint64_t prev_fp = (uint64_t)-1;
+				int fp_parity = 0;
+				for (int fi = 0; fi < n_fp; ++fi) {
+					if (pa.fp_buf[fi] != prev_fp) { prev_fp = pa.fp_buf[fi]; fp_parity = 0; }
+					pa.fp_used[fi] = fp_parity++ & 1; // bit 1 (consumed) starts at 0
+				}
+			}
 			for (i = pa.n_a = 0; i < n; ++i)
 				for (j = 0; j < n_plp[i]; ++j) {
 					al[pa.n_a] = pileup2allele(&plp[i][j], a->baseQ, (uint64_t)i<<32 | j, r, a->trim_len, a->del_as_allele);
+					if (a->dedup_overlap && !al[pa.n_a].is_skip && is_proper_same_chrom(&plp[i][j]))
+						if (fp_seen_before(pa.fp_buf, pa.fp_used, n_fp, pair_fingerprint(&plp[i][j])))
+							al[pa.n_a].is_skip = 1;
 					if (!al[pa.n_a].is_skip) ++pa.n_a;
 				}
 			if (pa.n_a == 0) continue; // no reads are good enough; zero effective coverage
@@ -385,6 +455,7 @@ static void process_sites(thread_arg_t *a)
 	// cleanup
 	free(n_plp); free(plp);
 	free(pa.cnt_strand); free(pa.cnt_supp); free(pa.a); free(pa.seq);
+	free(pa.fp_buf); free(pa.fp_used);
 	for (i = 0; i < n; ++i) {
 		hts_close(data[i]->fp);
 		if (data[i]->itr) bam_itr_destroy(data[i]->itr);
@@ -402,7 +473,7 @@ int main(int argc, char *argv[])
 {
 	int i, n, tid, beg, end;
 	int baseQ = 0, mapQ = 0, min_len = 0, min_support = 1, min_support_strand = 0, min_supp_len = 0;
-	int is_vcf = 0, var_only = 0, show_2strand = 0, trim_len = 0, del_as_allele = 0, proper_only = 0, nthreads = 1;
+	int is_vcf = 0, var_only = 0, show_2strand = 0, trim_len = 0, del_as_allele = 0, proper_only = 0, dedup_overlap = 0, nthreads = 1;
 	int nsites = 0;
 	bed_site_t *sites = NULL;
 	double min_af = 0.0;
@@ -414,7 +485,7 @@ int main(int argc, char *argv[])
 	ketopt_t o = KETOPT_INIT;
 
 	// parse the command line
-	while ((n = ketopt(&o, argc, argv, 1, "r:q:Q:l:f:p:vcCS:s:b:x:T:ea:yVPt:", 0)) >= 0) {
+	while ((n = ketopt(&o, argc, argv, 1, "r:q:Q:l:f:p:vcCS:s:b:x:T:ea:yVPt:D", 0)) >= 0) {
 		if (n == 'f') { fname = o.arg; fai = fai_load(fname); }
 		else if (n == 'b') { if (bed) bed_destroy(bed); bed = bed_read(o.arg); }
 		else if (n == 'x') { if (bed) bed_destroy(bed); bed = bed_read_vcf(o.arg); }
@@ -432,6 +503,7 @@ int main(int argc, char *argv[])
 		else if (n == 'e') del_as_allele = 1;
 		else if (n == 'p') min_af = atof(o.arg);
 		else if (n == 'P') proper_only = 1;
+		else if (n == 'D') dedup_overlap = 1;
 		else if (n == 't') nthreads = atoi(o.arg);
 		else if (n == 'y') mapQ = 20, baseQ = 20, min_support = 5, min_support_strand = 2, is_vcf = var_only = show_2strand = 1;
 		else if (n == 'V') {
@@ -461,6 +533,7 @@ int main(int argc, char *argv[])
 		fprintf(stderr, "    -x FILE      VCF/BCF of target sites; restrict pileup to these positions [null]\n");
 		fprintf(stderr, "    -t INT       number of threads [1]\n");
 		fprintf(stderr, "    -P           only consider properly paired reads for paired-end reads\n");
+		fprintf(stderr, "    -D           deduplicate overlapping read pairs (count each fragment once)\n");
 		fprintf(stderr, "    -q INT       minimum mapping quality [%d]\n", mapQ);
 		fprintf(stderr, "    -l INT       minimum alignment length [%d]\n", min_len);
 		fprintf(stderr, "    -S INT       minimum supplementary alignment length [0]\n");
@@ -546,6 +619,7 @@ int main(int argc, char *argv[])
 		targs[i].del_as_allele = del_as_allele;
 		targs[i].min_support  = min_support;
 		targs[i].min_support_strand = min_support_strand;
+		targs[i].dedup_overlap = dedup_overlap;
 		targs[i].min_af       = min_af;
 		if (nt > 1)
 			targs[i].out = open_memstream(&targs[i].out_buf, &targs[i].out_len);

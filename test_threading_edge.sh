@@ -231,6 +231,32 @@ done
 echo ""
 
 # ---------------------------------------------------------------------------
+echo "=== Case 6: -D (overlap deduplication) thread correctness ==="
+BASE_FLAGS_D="$BASE_FLAGS -D"
+
+echo "  Thread sweep (t=2,4,8,16,50,300) with -D"
+for nt in 2 4 8 16 50 300; do
+    run_case "D_t=1_vs_t=${nt}_all_sites" "$BASE_FLAGS_D" "$nt" "$TWO_CRAMS" "$ALL_VCF"
+done
+
+echo "  -D combined with other filters (t=1 vs t=4)"
+run_case "D_proper_pairs(-D_-P)"           "$BASE_FLAGS_D -P"        4 "$TWO_CRAMS" "$ALL_VCF"
+run_case "D_trim_len(-D_-T5)"              "$BASE_FLAGS_D -T 5"      4 "$TWO_CRAMS" "$ALL_VCF"
+run_case "D_min_support(-D_-s2)"           "-c -C -Q 20 -q 30 -s 2 -D" 4 "$TWO_CRAMS" "$ALL_VCF"
+run_case "D_loose_quality(-D_-Q10_-q10)"   "-c -C -Q 10 -q 10 -s 0 -D" 4 "$TWO_CRAMS" "$ALL_VCF"
+
+echo "  -D single-sample (t=4, t=16)"
+for nt in 4 16; do
+    run_case "D_single_sample_t=${nt}" "$BASE_FLAGS_D" "$nt" "$CRAM1" "$ALL_VCF"
+done
+
+echo "  -D threads > sites (chrXY t=50, t=300)"
+for nt in 50 300; do
+    run_case "D_chrXY_t=${nt}" "$BASE_FLAGS_D" "$nt" "$TWO_CRAMS" "$CHRXY_VCF"
+done
+echo ""
+
+# ---------------------------------------------------------------------------
 echo "=== SUMMARY ==="
 echo "PASS: $PASS"
 echo "FAIL: $FAIL"
