@@ -1,3 +1,23 @@
+## Changes
+
+This version extends the original minipileup with the following additions:
+
+**CRAM input support:** Input alignment files may be BAM or CRAM. When CRAM files
+are provided, the reference FASTA must be supplied with `-f`.
+
+**VCF/BCF target sites (`-x`):** A VCF or BCF file can be passed with `-x` to
+restrict the pileup to only the positions listed in that file, replacing the
+BED-based `-b` approach for SNP-centric workflows.
+
+**Overlap deduplication (`-D`):** For paired-end data, overlapping read pairs
+that span the same fragment are deduplicated so that each base is counted only
+once per fragment. Without this flag the overlapping portion is double-counted.
+
+**Site-level multithreading (`-t`):** The pileup over discrete target sites
+(`-x` or `-b`) can be split across multiple threads with `-t INT`. Because each
+thread independently processes a contiguous slice of sites, thread counts beyond
+2 yield diminishing returns in typical usage.
+
 ## Introduction
 
 Minipileup is a simple pileup-based variant caller. It takes a reference FASTA
