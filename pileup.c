@@ -517,7 +517,7 @@ int main(int argc, char *argv[])
 		return 1;
 	}
 	if (o.ind == argc) {
-		fprintf(stderr, "Usage: minipileup [options] in1.bam/cram [in2.bam/cram [...]]\n");
+		fprintf(stderr, "Usage: minipileup2 [options] in1.bam/cram [in2.bam/cram [...]]\n");
 		fprintf(stderr, "Options:\n");
 		fprintf(stderr, "  General:\n");
 		fprintf(stderr, "    -f FILE      reference genome FASTA (required for CRAM and VCF output) [null]\n");

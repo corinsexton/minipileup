@@ -25,7 +25,7 @@ and one or multiple alignment BAM as input, and outputs a multi-sample VCF along
 allele counts:
 ```sh
 samtools faidx ref.fa       # index FASTA; bgzip'd FASTA is not supported
-minipileup -yf ref.fa -p.2 aln1.bam aln2.bam > var.vcf
+minipileup2 -yf ref.fa -p.2 aln1.bam aln2.bam > var.vcf
 ```
 You can adjust mapping quality, base quality, alignment length and allele count
 thresholds, or specify regions on the command line.
