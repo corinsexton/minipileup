@@ -40,8 +40,11 @@ static int read_bam(void *data, bam1_t *b) // read level filters better go here 
 	int ret = aux->itr? bam_itr_next(aux->fp, aux->itr, b) : sam_read1(aux->fp, aux->h, b);
 	if (ret < 0) return ret;
 	if (b->core.tid < 0) b->core.flag |= BAM_FUNMAP;
-	// htslib >=1.0 no longer auto-filters these in bam_plp_push (old BAM_PLP_MASK); do it here
-	if (b->core.flag & (BAM_FSECONDARY | BAM_FQCFAIL | BAM_FDUP))
+	// htslib >=1.0 no longer auto-filters these in bam_plp_push (old BAM_PLP_MASK); do it here.
+	// BAM_FSUPPLEMENTARY is filtered too: minipileup2 does no SV/breakpoint analysis, and counting
+	// both the primary and supplementary records of a chimeric read at their respective loci would
+	// double-count a single physical read in depth/AD calculations.
+	if (b->core.flag & (BAM_FSECONDARY | BAM_FSUPPLEMENTARY | BAM_FQCFAIL | BAM_FDUP))
 		b->core.flag |= BAM_FUNMAP;
 	if (aux->proper_only && (b->core.flag&BAM_FPAIRED) && !(b->core.flag&BAM_FPROPER_PAIR))
 		b->core.flag |= BAM_FUNMAP;
@@ -96,26 +99,60 @@ static inline uint64_t pair_fingerprint(const bam_pileup1_t *p)
 	              : (uint64_t)(uint32_t)b << 32 | (uint32_t)a;
 }
 
-// fp_used encodes two bits per slot:
-//   bit 0 (value 1): skip decision — 0=keep (first of pair), 1=skip (second of pair)
-//   bit 1 (value 2): consumed — set when the slot is assigned to a read in the main loop
-//
-// Returns 1 (skip this read) or 0 (count this read).
-// Finds the first unconsumed slot for fp and returns its skip decision.
-static inline int fp_seen_before(uint64_t *fp_buf, uint8_t *fp_used, int n_fp, uint64_t fp)
+// Per-mate dedup record. -D groups reads by pair fingerprint (pos, mate_pos) and
+// chooses one mate per fragment to keep at each pileup column. Tiebreaks (in order):
+//   1) prefer the mate that won't be discarded for an unrelated reason (is_skip)
+//   2) higher base quality
+//   3) ALT-supporting wins over REF-supporting
+//   4) deterministic by slot
+typedef struct {
+	uint64_t fp;        // pair fingerprint = (pos, mpos), order-independent
+	uint64_t slot;      // i<<32 | j — identifies the read in the main pass
+	uint8_t  q;         // base quality at this column
+	uint8_t  is_alt;    // 1 if read carries non-ref allele at this column
+	uint8_t  is_skip;   // 1 if read is destined to be discarded by its own filters
+	uint8_t  skip_dec;  // dedup decision: 1 = skip in main pass
+} fp_entry_t;
+
+// Sort key for picking the winner within an fp run.
+// Lower is "more preferred" (sorts to front of run).
+#define fp_entry_lt(a, b) ( \
+	(a).fp != (b).fp ? (a).fp < (b).fp : \
+	(a).is_skip != (b).is_skip ? (a).is_skip < (b).is_skip : \
+	(a).q != (b).q ? (a).q > (b).q : \
+	(a).is_alt != (b).is_alt ? (a).is_alt > (b).is_alt : \
+	(a).slot < (b).slot )
+KSORT_INIT(fp_entry, fp_entry_t, fp_entry_lt)
+
+// Sort key for fast lookup by (fp, slot) once decisions are baked in.
+#define fp_lookup_lt(a, b) ((a).fp != (b).fp ? (a).fp < (b).fp : (a).slot < (b).slot)
+KSORT_INIT(fp_lookup, fp_entry_t, fp_lookup_lt)
+
+// Look up the dedup decision for a (fp, slot). Returns 1 if this read should be
+// skipped in the main pass, 0 if it's the chosen mate (or has no overlapping mate).
+static inline int fp_lookup_decision(const fp_entry_t *ent, int n, uint64_t fp, uint64_t slot)
 {
-	int lo = 0, hi = n_fp;
+	int lo = 0, hi = n;
 	while (lo < hi) {
 		int mid = (lo + hi) >> 1;
-		if (fp_buf[mid] < fp) lo = mid + 1;
+		if (ent[mid].fp < fp || (ent[mid].fp == fp && ent[mid].slot < slot)) lo = mid + 1;
 		else hi = mid;
 	}
-	if (lo >= n_fp || fp_buf[lo] != fp) return 0;
-	// advance past already-consumed slots for this fingerprint
-	while (lo < n_fp && fp_buf[lo] == fp && (fp_used[lo] & 2)) ++lo;
-	if (lo >= n_fp || fp_buf[lo] != fp) return 0;
-	int skip = fp_used[lo] & 1; // pre-computed skip decision for this slot
-	fp_used[lo] |= 2;           // mark consumed
+	return (lo < n && ent[lo].fp == fp && ent[lo].slot == slot) ? ent[lo].skip_dec : 0;
+}
+
+// Replicates the is_skip logic of pileup2allele() exactly, so the dedup pre-pass
+// and the main pass can never disagree on whether a read is destined to be dropped.
+// If pileup2allele() ever gains or loses a filter, update both sides together.
+static inline int is_skip_for_dedup(const bam_pileup1_t *p, int min_baseQ, int trim_len, int del_as_allele)
+{
+	int q = bam_get_qual(p->b)[p->qpos];
+	int skip;
+	if (del_as_allele)
+		skip = (p->is_refskip || q < min_baseQ);
+	else
+		skip = (p->is_del || p->is_refskip || q < min_baseQ);
+	if (p->qpos < trim_len || p->b->core.l_qseq - p->qpos < trim_len) skip = 1;
 	return skip;
 }
 
@@ -127,14 +164,8 @@ static inline allele_t pileup2allele(const bam_pileup1_t *p, int min_baseQ, uint
 	a.k = (1<<17) - 1; // this will be set in count_alleles()
 	a.q = bam_get_qual(p->b)[p->qpos];
 	a.is_rev = bam_is_rev(p->b);
-	if (del_as_allele) {
-		a.is_skip = (p->is_refskip || a.q < min_baseQ);
-		a.is_del = p->is_del;
-	} else {
-		a.is_skip = (p->is_del || p->is_refskip || a.q < min_baseQ);
-		a.is_del = 0;
-	}
-	if (p->qpos < trim_len || p->b->core.l_qseq - p->qpos < trim_len) a.is_skip = 1;
+	a.is_del = del_as_allele ? p->is_del : 0;
+	a.is_skip = is_skip_for_dedup(p, min_baseQ, trim_len, del_as_allele);
 	a.indel = p->indel;
 	a.b = a.hash = bam_seqi(seq, p->qpos);
 	a.pos = pos;
@@ -181,8 +212,7 @@ typedef struct {
 	int *support, *support_strand; // support across entire $a. It points to the last "row" of cnt_supp/cnt_strand
 	int len, max_len;
 	char *seq;
-	uint64_t *fp_buf;  // pair fingerprint buffer for overlap deduplication
-	uint8_t  *fp_used; // which fingerprint slots have been claimed this column
+	fp_entry_t *fp_ent; // per-mate dedup records for overlap deduplication
 	int max_fp;
 } paux_t;
 
@@ -330,35 +360,45 @@ static void process_sites(thread_arg_t *a)
 			if (a->dedup_overlap && pa.tot_dp + 1 > pa.max_fp) {
 				pa.max_fp = pa.tot_dp + 1;
 				kroundup32(pa.max_fp);
-				pa.fp_buf  = (uint64_t*)realloc(pa.fp_buf,  pa.max_fp * sizeof(uint64_t));
-				pa.fp_used = (uint8_t*)realloc(pa.fp_used,  pa.max_fp * sizeof(uint8_t));
+				pa.fp_ent = (fp_entry_t*)realloc(pa.fp_ent, pa.max_fp * sizeof(fp_entry_t));
 			}
 			al = pa.a;
 			// collect alleles; ref is fetched per full chromosome so offset is just pos
 			r = (ref && pos < l_ref)? seq_nt16_table[(int)ref[pos]] : 15;
 			if (a->dedup_overlap) {
-				// pre-pass: build sorted fingerprint table of all proper paired reads in this column
+				// Pre-pass: collect a record per proper-paired read at this column, then
+				// pick a winner per fingerprint by (non-skip, BQ desc, ALT, slot).
 				for (i = 0; i < n; ++i)
-					for (j = 0; j < n_plp[i]; ++j)
-						if (is_proper_same_chrom(&plp[i][j]))
-							pa.fp_buf[n_fp++] = pair_fingerprint(&plp[i][j]);
-				ks_introsort(uint64, n_fp, pa.fp_buf);
-				// assign alternating skip decisions within each run of identical fingerprints:
-				// even positions (0, 2, 4, ...) = keep (bit 0 = 0)
-				// odd positions  (1, 3, 5, ...) = skip (bit 0 = 1)
+					for (j = 0; j < n_plp[i]; ++j) {
+						const bam_pileup1_t *pp = &plp[i][j];
+						if (!is_proper_same_chrom(pp)) continue;
+						fp_entry_t *e = &pa.fp_ent[n_fp++];
+						e->fp   = pair_fingerprint(pp);
+						e->slot = (uint64_t)i << 32 | (uint32_t)j;
+						e->q    = bam_get_qual(pp->b)[pp->qpos];
+						int b   = bam_seqi(bam_get_seq(pp->b), pp->qpos);
+						e->is_alt   = (pp->is_del || pp->is_refskip || pp->indel != 0 || r == 15 || b != r);
+						e->is_skip  = is_skip_for_dedup(pp, a->baseQ, a->trim_len, a->del_as_allele);
+						e->skip_dec = 0;
+					}
+				// 1) sort by tiebreak: first entry per fp run becomes the winner
+				ks_introsort(fp_entry, n_fp, pa.fp_ent);
 				uint64_t prev_fp = (uint64_t)-1;
-				int fp_parity = 0;
 				for (int fi = 0; fi < n_fp; ++fi) {
-					if (pa.fp_buf[fi] != prev_fp) { prev_fp = pa.fp_buf[fi]; fp_parity = 0; }
-					pa.fp_used[fi] = fp_parity++ & 1; // bit 1 (consumed) starts at 0
+					if (pa.fp_ent[fi].fp != prev_fp) prev_fp = pa.fp_ent[fi].fp; // first per fp = keep
+					else pa.fp_ent[fi].skip_dec = 1;                              // rest = skip
 				}
+				// 2) re-sort by (fp, slot) so the main pass can binary-search
+				ks_introsort(fp_lookup, n_fp, pa.fp_ent);
 			}
 			for (i = pa.n_a = 0; i < n; ++i)
 				for (j = 0; j < n_plp[i]; ++j) {
 					al[pa.n_a] = pileup2allele(&plp[i][j], a->baseQ, (uint64_t)i<<32 | j, r, a->trim_len, a->del_as_allele);
-					if (a->dedup_overlap && !al[pa.n_a].is_skip && is_proper_same_chrom(&plp[i][j]))
-						if (fp_seen_before(pa.fp_buf, pa.fp_used, n_fp, pair_fingerprint(&plp[i][j])))
+					if (a->dedup_overlap && !al[pa.n_a].is_skip && is_proper_same_chrom(&plp[i][j])) {
+						uint64_t slot = (uint64_t)i << 32 | (uint32_t)j;
+						if (fp_lookup_decision(pa.fp_ent, n_fp, pair_fingerprint(&plp[i][j]), slot))
 							al[pa.n_a].is_skip = 1;
+					}
 					if (!al[pa.n_a].is_skip) ++pa.n_a;
 				}
 			if (pa.n_a == 0) continue; // no reads are good enough; zero effective coverage
@@ -455,7 +495,7 @@ static void process_sites(thread_arg_t *a)
 	// cleanup
 	free(n_plp); free(plp);
 	free(pa.cnt_strand); free(pa.cnt_supp); free(pa.a); free(pa.seq);
-	free(pa.fp_buf); free(pa.fp_used);
+	free(pa.fp_ent);
 	for (i = 0; i < n; ++i) {
 		hts_close(data[i]->fp);
 		if (data[i]->itr) bam_itr_destroy(data[i]->itr);
